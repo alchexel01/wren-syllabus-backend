@@ -13,6 +13,9 @@ Endpoints:
     GET  /subjects                   — list loaded subjects
     POST /rag/context                — get grounding text for a query
     POST /admin/reload               — re-scan syllabus_data/ (needs API key)
+    POST /premium/initialize         — start a Paystack transaction, get checkout URL
+    GET  /premium/verify/{reference} — confirm payment, activate premium for 365 days
+    GET  /premium/status/{device_id} — is this device currently premium, until when
     POST /chat                       — proxies to Groq chat completions
     POST /transcribe                 — proxies to Groq Whisper transcription
     GET  /model/{key}                — streams an offline model file from HF
@@ -33,8 +36,19 @@ from typing import Optional
 import httpx
 
 import rag_engine
+import premium
 
 app = FastAPI(title="Wren Syllabus Backend", version="1.0")
+
+
+@app.on_event("startup")
+async def _startup():
+    await premium.init_db()
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await premium.close_db()
 
 # ── Error / crash logging ────────────────────────────────────────────────
 # Every request gets a short request_id. It's included in:
@@ -204,6 +218,44 @@ def admin_reload(x_admin_key: str = Header(default="")):
         raise HTTPException(status_code=401, detail="invalid or missing admin key")
     n = rag_engine.reload_all()
     return {"reloaded": True, "chunks_loaded": n}
+
+
+# ── Premium (Paystack) ───────────────────────────────────────────────────
+# One-time N3,000 / 365-day purchase. Not a subscription — see
+# premium.py for the full design notes and why Postgres (not this
+# service's own disk) is the store of record.
+
+@app.post("/premium/initialize", response_model=premium.InitializeResponse)
+async def premium_initialize_route(
+    payload: premium.InitializeRequest,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await premium.premium_initialize(payload, rid)
+
+
+@app.get("/premium/verify/{reference}", response_model=premium.StatusResponse)
+async def premium_verify_route(
+    reference: str,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await premium.premium_verify(reference, rid)
+
+
+@app.get("/premium/status/{device_id}", response_model=premium.StatusResponse)
+async def premium_status_route(
+    device_id: str,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await premium.premium_status(device_id, rid)
 
 
 @app.post("/chat")
