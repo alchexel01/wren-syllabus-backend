@@ -128,9 +128,11 @@ async def premium_initialize(payload: InitializeRequest, rid: str) -> Initialize
     # Paystack requires an email on the initialize call even though we
     # don't otherwise collect one from the app. Devices don't have a
     # real email tied to them here, so we synthesize a stable
-    # per-device placeholder — Paystack only uses it for the receipt,
-    # and nothing in this app currently depends on that inbox existing.
-    email = payload.email or f"{device_id}@device.wrenai.local"
+    # per-device placeholder. Using a real, resolvable domain (gmail.com)
+    # rather than a made-up one like "device.wrenai.local" — Paystack's
+    # validator rejects addresses on domains with no MX record, which
+    # silently failed every initialize call under a generic 502.
+    email = payload.email or f"wren-device-{device_id}@gmail.com"
 
     async with httpx.AsyncClient(timeout=20) as client:
         try:
