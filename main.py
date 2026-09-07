@@ -106,7 +106,13 @@ ADMIN_KEY = os.environ.get("WREN_ADMIN_KEY", "")
 # your Groq/HF credentials for free. Rotate this any time by changing
 # the env var on Render; the app needs the same value set on its side
 # (see WREN_APP_SECRET in AI.py).
-APP_SECRET = os.environ.get("WREN_APP_SECRET", "")
+#
+# .strip() guards against the single most common cause of "the values
+# look identical but auth still fails": Render's dashboard textbox (or
+# a copy-paste) silently including a trailing space or newline in the
+# saved env var. Without stripping, "secret" and "secret\n" compare as
+# different strings even though they render identically on screen.
+APP_SECRET = os.environ.get("WREN_APP_SECRET", "").strip()
 
 # Real provider credentials. These never leave the server.
 # Add GROQ_API_KEY_2, _3, etc. on Render if you want multiple keys in
@@ -128,14 +134,37 @@ OFFLINE_MODELS = {
 }
 
 
+import hashlib
+
+
+def _fingerprint(s: str) -> str:
+    """Never logs the actual secret — just enough to compare two
+    values without ever printing either one: length + a short hash
+    prefix. Two equal secrets always produce an identical fingerprint;
+    two secrets that merely *look* the same (e.g. one has a trailing
+    space, or was truncated on paste) will show either a different
+    length or a different hash, which is the tell."""
+    if not s:
+        return "EMPTY"
+    return f"len={len(s)} sha256={hashlib.sha256(s.encode()).hexdigest()[:10]}"
+
+
+log.info(f"[startup] WREN_APP_SECRET fingerprint: {_fingerprint(APP_SECRET)}")
+
+
 def _check_app_secret(x_app_secret: str, rid: str = "-"):
     """Every proxy route requires the shared app secret. Without this,
     anyone who finds this URL could spend your Groq/HF quota for free.
     Logged explicitly so a rotated/mismatched WREN_APP_SECRET shows up
     as a clear 401 in the logs instead of looking like a generic
     network failure on the client."""
-    if not APP_SECRET or x_app_secret != APP_SECRET:
-        log.warning(f"[{rid}] auth failed: missing or mismatched X-App-Secret")
+    incoming = (x_app_secret or "").strip()
+    if not APP_SECRET or incoming != APP_SECRET:
+        log.warning(
+            f"[{rid}] auth failed: X-App-Secret mismatch. "
+            f"server={_fingerprint(APP_SECRET)} "
+            f"received={_fingerprint(incoming)}"
+        )
         raise HTTPException(status_code=401,
                              detail={"error": "invalid or missing app secret", "request_id": rid})
 
