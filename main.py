@@ -16,6 +16,8 @@ Endpoints:
     POST /premium/initialize         — start a Paystack transaction, get checkout URL
     GET  /premium/verify/{reference} — confirm payment, activate premium for 365 days
     GET  /premium/status/{device_id} — is this device currently premium, until when
+    POST /premium/restore            — one-time: re-link an email's premium to a new device_id
+    DELETE /premium/reset/{email}    — TESTING ONLY: wipe an email's premium record
     POST /chat                       — proxies to Groq chat completions
     POST /transcribe                 — proxies to Groq Whisper transcription
     GET  /model/{key}                — streams an offline model file from HF
@@ -256,6 +258,38 @@ async def premium_status_route(
     rid = req.state.rid
     _check_app_secret(x_app_secret, rid)
     return await premium.premium_status(device_id, rid)
+
+
+@app.post("/premium/restore", response_model=premium.StatusResponse)
+async def premium_restore_route(
+    payload: premium.RestoreRequest,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    """One-time-per-email restore: re-links an email's existing premium
+    purchase to whatever device_id is asking. Meant for the case where
+    a reinstall regenerated the device's fallback UUID and orphaned a
+    paying user's premium — see premium.py for the full identity model."""
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await premium.premium_restore(payload, rid)
+
+
+@app.delete("/premium/reset/{email}", response_model=premium.StatusResponse)
+async def premium_reset_route(
+    email: str,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    """TESTING ONLY — wipes any premium record for an email so the
+    purchase flow can be re-run from scratch. Same X-App-Secret gate as
+    every other route here; nothing extra-locked-down about it, so
+    don't rely on this being hidden from anyone who has the app
+    secret — it's meant for you during development, not as a
+    production admin feature."""
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await premium.premium_reset(email, rid)
 
 
 @app.post("/chat")
