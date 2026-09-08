@@ -18,6 +18,9 @@ Endpoints:
     GET  /premium/status/{device_id} — is this device currently premium, until when
     POST /premium/restore            — one-time: re-link an email's premium to a new device_id
     DELETE /premium/reset/{email}    — TESTING ONLY: wipe an email's premium record
+    GET  /auth/google/start          — get a Google sign-in URL + session_id
+    GET  /auth/google/callback       — Google redirects here after sign-in
+    GET  /auth/google/status/{id}    — poll: has this session's sign-in completed?
     POST /chat                       — proxies to Groq chat completions
     POST /transcribe                 — proxies to Groq Whisper transcription
     GET  /model/{key}                — streams an offline model file from HF
@@ -39,6 +42,7 @@ import httpx
 
 import rag_engine
 import premium
+import auth
 
 app = FastAPI(title="Wren Syllabus Backend", version="1.0")
 
@@ -290,6 +294,37 @@ async def premium_reset_route(
     rid = req.state.rid
     _check_app_secret(x_app_secret, rid)
     return await premium.premium_reset(email, rid)
+
+
+# ── Google Sign-In ────────────────────────────────────────────────────
+# App opens a browser to /auth/google/start's authorization_url, Google
+# redirects back to /auth/google/callback on this backend, and the app
+# polls /auth/google/status/{session_id} until the verified email shows
+# up — same shape as the Paystack initialize/verify polling above.
+# See auth.py for the full design notes.
+
+@app.get("/auth/google/start", response_model=auth.AuthStartResponse)
+def auth_google_start_route(req: Request, x_app_secret: str = Header(default="")):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return auth.auth_google_start(rid)
+
+
+@app.get("/auth/google/callback")
+async def auth_google_callback_route(code: str, state: str, req: Request):
+    # No X-App-Secret here on purpose — Google itself calls this URL
+    # via browser redirect, not the app, so it can't attach that
+    # header. Security instead comes from verifying the ID token's
+    # signature server-side in auth.py.
+    rid = req.state.rid
+    return await auth.auth_google_callback(code, state, rid)
+
+
+@app.get("/auth/google/status/{session_id}", response_model=auth.AuthStatusResponse)
+def auth_google_status_route(session_id: str, req: Request, x_app_secret: str = Header(default="")):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return auth.auth_google_status(session_id, rid)
 
 
 @app.post("/chat")
