@@ -4,3 +4,4 @@ httpx
 python-multipart
 asyncpg
 google-auth
+requests
