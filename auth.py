@@ -217,8 +217,12 @@ def _result_page(message: str, ok: bool) -> HTMLResponse:
     color = "#16a34a" if ok else "#dc2626"
     html = f"""
     <html>
-      <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+      <head>
+        <title>Sign in to Wren AI</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+      </head>
       <body style="font-family: -apple-system, sans-serif; text-align: center; padding: 48px 24px;">
+        <p style="font-size: 15px; color: #6b7280; margin-bottom: 4px;">Wren AI</p>
         <p style="color: {color}; font-size: 18px;">{message}</p>
       </body>
     </html>
