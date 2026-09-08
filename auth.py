@@ -34,7 +34,7 @@ Env vars required (Render dashboard, same place as the others):
     GOOGLE_CLIENT_SECRET   — from the same client (Client secret)
     GOOGLE_REDIRECT_URI    — must exactly match an Authorized redirect
                              URI registered on that client, e.g.
-                             https://wren-syllabus-backend.onrender.com/auth/google/callback
+                             https://wrenai-application.onrender.com/auth/google/callback
 """
 
 import os
