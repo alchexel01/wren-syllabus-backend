@@ -67,8 +67,67 @@ _RAG_STOPWORDS = {
 
 
 def _rag_tokenize(text):
-    words = re.findall(r"[a-z]+", text.lower())
-    return [w for w in words if w not in _RAG_STOPWORDS and len(w) > 2]
+    lower = text.lower()
+    words = re.findall(r"[a-z][a-z0-9]*", lower)
+    tokens = [w for w in words if w not in _RAG_STOPWORDS and len(w) > 2]
+    for pattern, extra_tokens in _CHEM_ALIASES:
+        if pattern.search(lower):
+            tokens.extend(extra_tokens)
+    return tokens
+
+
+# ── Chemical formula <-> IUPAC-name synonym expansion ────────────────
+# BM25 is purely lexical — it only matches tokens that literally appear
+# in both the query and the document. The JAMB syllabus text is written
+# in formal nomenclature ("carbon (IV) oxide", "trioxonitrate (V)
+# acid") and never writes the bare formula a student actually types
+# ("CO2", "HNO3"). On top of that, the old tokenizer regex (`[a-z]+`)
+# stripped every digit outright, so even a query that WAS just "CO2"
+# tokenized down to a lone, too-short "co" and vanished entirely (see
+# the digit-preserving regex above — this was the actual cause of a
+# perfectly in-syllabus question like "properties of CO2" coming back
+# "NO MATCH" / "outside the syllabus", verified against the real
+# chemistry.json: the syllabus's "Non-metals and their compounds"
+# topic explicitly covers "Carbon(IV) oxide: laboratory preparation,
+# properties and uses" — the content was there, the query just could
+# never reach it).
+#
+# Each entry below is (raw-text regex, [extra tokens to add when it
+# matches]) — applied to BOTH documents at load time and queries at
+# retrieval time, so a formula in the query can find a name in the
+# document and vice versa. This list only covers the handful of
+# substances the JAMB chemistry syllabus names explicitly; extend it
+# (or add a similar table for another subject) by appending more
+# (pattern, tokens) pairs — no other code needs to change.
+_CHEM_ALIASES = [
+    (r'\bco2\b|\bcarbon\s*\(?iv\)?\s*oxide\b|\bcarbon\s*dioxide\b',
+     ['co2', 'carbondioxide']),
+    (r'\bco\b|\bcarbon\s*\(?ii\)?\s*oxide\b|\bcarbon\s*monoxide\b',
+     ['co', 'carbonmonoxide']),
+    (r'\bh2o\b|\bwater\b', ['h2o']),
+    (r'\bso2\b|\bsulphur\s*\(?iv\)?\s*oxide\b|\bsulfur\s*dioxide\b',
+     ['so2', 'sulphurdioxide']),
+    (r'\bso3\b|\bsulphur\s*\(?vi\)?\s*oxide\b|\bsulfur\s*trioxide\b',
+     ['so3', 'sulphurtrioxide']),
+    (r'\bnh3\b|\bammonia\b', ['nh3', 'ammonia']),
+    (r'\bhcl\b|\bhydrogen\s*chloride\b|\bhydrochloric\s*acid\b',
+     ['hcl', 'hydrochloricacid']),
+    (r'\bhno3\b|\btrioxonitrate\s*\(?v\)?\s*acid\b|\bnitric\s*acid\b',
+     ['hno3', 'nitricacid']),
+    (r'\bh2so4\b|\btetraoxosulphate\s*\(?vi\)?\s*acid\b|\bsulphuric\s*acid\b|\bsulfuric\s*acid\b',
+     ['h2so4', 'sulphuricacid']),
+    (r'\bno2\b|\bnitrogen\s*\(?iv\)?\s*oxide\b', ['no2']),
+    (r'\bn2o\b|\bnitrogen\s*\(?i\)?\s*oxide\b', ['n2o']),
+    (r'\bh2s\b|\bhydrogen\s*sulphide\b|\bhydrogen\s*sulfide\b', ['h2s']),
+    (r'\bo2\b|\boxygen\s*gas\b', ['o2']),
+    (r'\bo3\b|\bozone\b|\btrioxygen\b', ['o3', 'ozone']),
+    (r'\bn2\b|\bnitrogen\s*gas\b', ['n2']),
+    (r'\bcl2\b|\bchlorine\s*gas\b', ['cl2']),
+    (r'\bnacl\b|\bsodium\s*chloride\b|\bcommon\s*salt\b', ['nacl']),
+    (r'\bcaco3\b|\bcalcium\s*trioxocarbonate\s*\(?iv\)?\b|\bcalcium\s*carbonate\b',
+     ['caco3']),
+]
+_CHEM_ALIASES = [(re.compile(p), toks) for p, toks in _CHEM_ALIASES]
 
 
 def _load_all_subject_chunks(data_dir):
