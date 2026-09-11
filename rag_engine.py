@@ -162,6 +162,7 @@ class SyllabusRAG:
     def __init__(self, data_dir=DATA_DIR):
         self.chunks = []
         self._doc_tokens = []
+        self._doc_title_tokens = []
         # subject_lower -> {'doc_freq': Counter, 'doc_idxs': [i, ...],
         #                    'n_docs': int, 'avg_doc_len': float}
         self._subjects = {}
@@ -171,8 +172,19 @@ class SyllabusRAG:
         try:
             self.chunks = _load_all_subject_chunks(data_dir)
             self._doc_tokens = []
+            self._doc_title_tokens = []
             for chunk in self.chunks:
-                self._doc_tokens.append(_rag_tokenize(chunk.get('text', '')))
+                # Optional per-chunk 'keywords' list (e.g.
+                # ["centripetal force", "circular motion formula"]) lets
+                # you hand-add phrasings a student is likely to type
+                # without touching any code — just edit the JSON. Not
+                # required; chunks without it work exactly as before.
+                kw_text = ' '.join(chunk.get('keywords') or [])
+                self._doc_tokens.append(
+                    _rag_tokenize(chunk.get('text', '') + ' ' + kw_text))
+                self._doc_title_tokens.append(set(_rag_tokenize(
+                    f"{chunk.get('topic_title', '')} "
+                    f"{chunk.get('section', '')} {kw_text}")))
 
             subjects = {}
             for i, chunk in enumerate(self.chunks):
@@ -197,6 +209,7 @@ class SyllabusRAG:
             print(f'[wren_rag] failed to load syllabus data: {e}')
             self.chunks = []
             self._doc_tokens = []
+            self._doc_title_tokens = []
             self._subjects = {}
 
     def _idf(self, word, bucket):
@@ -205,23 +218,47 @@ class SyllabusRAG:
             return 0.0
         return math.log((bucket['n_docs'] + 1) / (df + 1)) + 1
 
-    def _score(self, query_tokens, doc_tokens, bucket):
+    # Added on top of the plain BM25 body score. topic_title/section
+    # (and any hand-added 'keywords') are short, curated, human-written
+    # labels — a query word landing there is a far more reliable
+    # topical signal than the same word appearing once inside a long
+    # combined-topic body chunk, where BM25's own length-normalization
+    # can bury a genuine match under everything else packed into that
+    # chunk (e.g. a chemistry chunk titled "Non-metals and their
+    # compounds" bundles six unrelated substances into one document —
+    # a hit that's ALSO in the title is worth much more than a hit
+    # that's merely somewhere in 400+ words of body text). This bonus
+    # is deliberately flat (not IDF-weighted, not length-normalized) so
+    # it fires at full strength every time: a "simple" question that
+    # essentially repeats a topic's own name (the common case — e.g.
+    # "formula for centripetal force" naming a "Circular motion /
+    # centripetal force" topic almost verbatim) reliably clears
+    # _RAG_MIN_SCORE instead of depending on how that phrase happens to
+    # be worded in the body paragraph.
+    _TITLE_MATCH_BONUS = 3.0
+
+    def _score(self, query_tokens, doc_tokens, bucket, title_tokens=None):
         if not doc_tokens:
             return 0.0
         k1, b = 1.5, 0.75
         doc_counter = Counter(doc_tokens)
         doc_len = len(doc_tokens)
         score = 0.0
-        for word in set(query_tokens):
+        qset = set(query_tokens)
+        for word in qset:
             f = doc_counter.get(word, 0)
             if f == 0:
                 continue
             idf = self._idf(word, bucket)
             denom = f + k1 * (1 - b + b * doc_len / bucket['avg_doc_len'])
             score += idf * (f * (k1 + 1)) / denom
+        if title_tokens:
+            score += self._TITLE_MATCH_BONUS * len(qset & title_tokens)
         return score
 
-    def retrieve(self, query, subject=None, top_k=2):
+    def retrieve(self, query, subject=None, top_k=2, min_score=None):
+        if min_score is None:
+            min_score = _RAG_MIN_SCORE
         query_tokens = _rag_tokenize(query)
         if not query_tokens or not self.chunks:
             return []
@@ -236,15 +273,30 @@ class SyllabusRAG:
         scored = []
         for bucket in buckets.values():
             for i in bucket['doc_idxs']:
-                s = self._score(query_tokens, self._doc_tokens[i], bucket)
+                s = self._score(query_tokens, self._doc_tokens[i], bucket,
+                                 title_tokens=self._doc_title_tokens[i])
                 scored.append((i, s))
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [(self.chunks[i], s) for i, s in scored[:top_k] if s >= _RAG_MIN_SCORE]
+        return [(self.chunks[i], s) for i, s in scored[:top_k] if s >= min_score]
 
     def get_context_for(self, query, subject=None):
         results = self.retrieve(query, subject=subject)
 
         if not results:
+            # Visibility fix: previously there was no way to tell, from
+            # outside, whether grounding ran at all versus genuinely
+            # found nothing — this logs the query plus the best
+            # candidates it found even though none cleared the bar, so
+            # a look at the Render logs immediately shows whether it's
+            # a near-miss (useful for tuning _RAG_MIN_SCORE /
+            # _TITLE_MATCH_BONUS, or adding 'keywords' to a chunk) or a
+            # genuine gap in the loaded syllabus data.
+            near = self.retrieve(query, subject=subject, top_k=3, min_score=0.0)
+            near_desc = ', '.join(
+                f'{c["topic_title"]}={s:.2f}' for c, s in near
+            ) if near else 'no chunks scored above zero'
+            print(f'[wren_rag] NO MATCH  query={query!r} subject={subject!r} '
+                  f'threshold={_RAG_MIN_SCORE} closest: {near_desc}')
             return (
                 "\n\n--- JAMB SYLLABUS GROUNDING: NO MATCH ---\n"
                 "No topic in the indexed JAMB syllabus data matched this "
@@ -253,6 +305,10 @@ class SyllabusRAG:
                 "topics currently loaded, rather than answering from "
                 "general knowledge as if it were syllabus-backed."
             )
+
+        matched_desc = ', '.join(
+            f'{c["topic_title"]}={s:.2f}' for c, s in results)
+        print(f'[wren_rag] MATCH     query={query!r} subject={subject!r} -> {matched_desc}')
 
         parts = [
             "\n\n--- JAMB SYLLABUS GROUNDING: STRICT MODE ---\n"
