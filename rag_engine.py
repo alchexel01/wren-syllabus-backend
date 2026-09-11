@@ -17,31 +17,6 @@ exactly like biology.json — a list of topic objects with at least:
 
 Then call reload_all() (or just restart the server) — no code changes
 needed. All *.json files in syllabus_data/ are loaded automatically.
-
-PER-SUBJECT STATISTICS (important)
------------------------------------
-BM25 scoring depends on corpus-wide statistics: how common a word is
-across all documents (document frequency, feeding into IDF) and the
-average document length. If those statistics are computed over ALL
-subjects pooled together, then loading a new subject changes the
-statistics used to score every OTHER subject's chunks too — a word
-that used to be rare (high IDF, strong signal) can look "common" once
-a second or third subject also uses it, quietly lowering scores for
-subjects that never changed at all. That's what was happening here:
-Biology matches stopped clearing the match threshold after Chemistry/
-Physics/etc. were added, even though nothing about Biology's own data
-changed.
-
-The fix: each subject gets its OWN document-frequency table, document
-count, and average document length, computed only from that subject's
-own chunks. Adding a tenth subject cannot change the first subject's
-scores, because the first subject's statistics never look outside its
-own chunks. When no subject filter is given, we score each chunk
-against its own subject's statistics and pool the results together
-for ranking — cross-subject comparability is inherently a bit fuzzier
-in that case (different subjects, different scales), but the far more
-common case — a query scored within one known subject — is now
-completely stable no matter how many other subjects get added later.
 """
 
 import os
@@ -67,67 +42,8 @@ _RAG_STOPWORDS = {
 
 
 def _rag_tokenize(text):
-    lower = text.lower()
-    words = re.findall(r"[a-z][a-z0-9]*", lower)
-    tokens = [w for w in words if w not in _RAG_STOPWORDS and len(w) > 2]
-    for pattern, extra_tokens in _CHEM_ALIASES:
-        if pattern.search(lower):
-            tokens.extend(extra_tokens)
-    return tokens
-
-
-# ── Chemical formula <-> IUPAC-name synonym expansion ────────────────
-# BM25 is purely lexical — it only matches tokens that literally appear
-# in both the query and the document. The JAMB syllabus text is written
-# in formal nomenclature ("carbon (IV) oxide", "trioxonitrate (V)
-# acid") and never writes the bare formula a student actually types
-# ("CO2", "HNO3"). On top of that, the old tokenizer regex (`[a-z]+`)
-# stripped every digit outright, so even a query that WAS just "CO2"
-# tokenized down to a lone, too-short "co" and vanished entirely (see
-# the digit-preserving regex above — this was the actual cause of a
-# perfectly in-syllabus question like "properties of CO2" coming back
-# "NO MATCH" / "outside the syllabus", verified against the real
-# chemistry.json: the syllabus's "Non-metals and their compounds"
-# topic explicitly covers "Carbon(IV) oxide: laboratory preparation,
-# properties and uses" — the content was there, the query just could
-# never reach it).
-#
-# Each entry below is (raw-text regex, [extra tokens to add when it
-# matches]) — applied to BOTH documents at load time and queries at
-# retrieval time, so a formula in the query can find a name in the
-# document and vice versa. This list only covers the handful of
-# substances the JAMB chemistry syllabus names explicitly; extend it
-# (or add a similar table for another subject) by appending more
-# (pattern, tokens) pairs — no other code needs to change.
-_CHEM_ALIASES = [
-    (r'\bco2\b|\bcarbon\s*\(?iv\)?\s*oxide\b|\bcarbon\s*dioxide\b',
-     ['co2', 'carbondioxide']),
-    (r'\bco\b|\bcarbon\s*\(?ii\)?\s*oxide\b|\bcarbon\s*monoxide\b',
-     ['co', 'carbonmonoxide']),
-    (r'\bh2o\b|\bwater\b', ['h2o']),
-    (r'\bso2\b|\bsulphur\s*\(?iv\)?\s*oxide\b|\bsulfur\s*dioxide\b',
-     ['so2', 'sulphurdioxide']),
-    (r'\bso3\b|\bsulphur\s*\(?vi\)?\s*oxide\b|\bsulfur\s*trioxide\b',
-     ['so3', 'sulphurtrioxide']),
-    (r'\bnh3\b|\bammonia\b', ['nh3', 'ammonia']),
-    (r'\bhcl\b|\bhydrogen\s*chloride\b|\bhydrochloric\s*acid\b',
-     ['hcl', 'hydrochloricacid']),
-    (r'\bhno3\b|\btrioxonitrate\s*\(?v\)?\s*acid\b|\bnitric\s*acid\b',
-     ['hno3', 'nitricacid']),
-    (r'\bh2so4\b|\btetraoxosulphate\s*\(?vi\)?\s*acid\b|\bsulphuric\s*acid\b|\bsulfuric\s*acid\b',
-     ['h2so4', 'sulphuricacid']),
-    (r'\bno2\b|\bnitrogen\s*\(?iv\)?\s*oxide\b', ['no2']),
-    (r'\bn2o\b|\bnitrogen\s*\(?i\)?\s*oxide\b', ['n2o']),
-    (r'\bh2s\b|\bhydrogen\s*sulphide\b|\bhydrogen\s*sulfide\b', ['h2s']),
-    (r'\bo2\b|\boxygen\s*gas\b', ['o2']),
-    (r'\bo3\b|\bozone\b|\btrioxygen\b', ['o3', 'ozone']),
-    (r'\bn2\b|\bnitrogen\s*gas\b', ['n2']),
-    (r'\bcl2\b|\bchlorine\s*gas\b', ['cl2']),
-    (r'\bnacl\b|\bsodium\s*chloride\b|\bcommon\s*salt\b', ['nacl']),
-    (r'\bcaco3\b|\bcalcium\s*trioxocarbonate\s*\(?iv\)?\b|\bcalcium\s*carbonate\b',
-     ['caco3']),
-]
-_CHEM_ALIASES = [(re.compile(p), toks) for p, toks in _CHEM_ALIASES]
+    words = re.findall(r"[a-z]+", text.lower())
+    return [w for w in words if w not in _RAG_STOPWORDS and len(w) > 2]
 
 
 def _load_all_subject_chunks(data_dir):
@@ -154,161 +70,90 @@ def _load_all_subject_chunks(data_dir):
 
 
 class SyllabusRAG:
-    """BM25-style scorer with a SEPARATE statistics table per subject
-    (document frequency, document count, average document length).
-    Loading more subjects only ever adds new, independent tables — it
-    never touches the statistics an existing subject scores against."""
+    """Same BM25-style scorer as the on-device module. One instance
+    holds ALL subjects' chunks together — the /rag/context endpoint
+    filters by `subject` after retrieval so each subject still gets
+    its own focused index behavior."""
 
     def __init__(self, data_dir=DATA_DIR):
         self.chunks = []
         self._doc_tokens = []
-        self._doc_title_tokens = []
-        # subject_lower -> {'doc_freq': Counter, 'doc_idxs': [i, ...],
-        #                    'n_docs': int, 'avg_doc_len': float}
-        self._subjects = {}
+        self._doc_freq = Counter()
+        self._n_docs = 0
+        self._avg_doc_len = 1.0
         self._load(data_dir)
 
     def _load(self, data_dir):
         try:
             self.chunks = _load_all_subject_chunks(data_dir)
             self._doc_tokens = []
-            self._doc_title_tokens = []
+            self._doc_freq = Counter()
             for chunk in self.chunks:
-                # Optional per-chunk 'keywords' list (e.g.
-                # ["centripetal force", "circular motion formula"]) lets
-                # you hand-add phrasings a student is likely to type
-                # without touching any code — just edit the JSON. Not
-                # required; chunks without it work exactly as before.
-                kw_text = ' '.join(chunk.get('keywords') or [])
-                self._doc_tokens.append(
-                    _rag_tokenize(chunk.get('text', '') + ' ' + kw_text))
-                self._doc_title_tokens.append(set(_rag_tokenize(
-                    f"{chunk.get('topic_title', '')} "
-                    f"{chunk.get('section', '')} {kw_text}")))
-
-            subjects = {}
-            for i, chunk in enumerate(self.chunks):
-                subj_key = chunk.get('subject', '').strip().lower()
-                if not subj_key:
-                    continue
-                bucket = subjects.setdefault(subj_key, {
-                    'doc_freq': Counter(), 'doc_idxs': [], 'total_len': 0,
-                })
-                bucket['doc_idxs'].append(i)
-                bucket['total_len'] += len(self._doc_tokens[i])
-                for word in set(self._doc_tokens[i]):
-                    bucket['doc_freq'][word] += 1
-
-            for bucket in subjects.values():
-                n = len(bucket['doc_idxs'])
-                bucket['n_docs'] = n
-                bucket['avg_doc_len'] = (bucket['total_len'] / n) if n else 1.0
-
-            self._subjects = subjects
+                tokens = _rag_tokenize(chunk.get('text', ''))
+                self._doc_tokens.append(tokens)
+                for word in set(tokens):
+                    self._doc_freq[word] += 1
+            self._n_docs = len(self.chunks)
+            if self._doc_tokens:
+                self._avg_doc_len = sum(len(t) for t in self._doc_tokens) / len(self._doc_tokens)
         except Exception as e:
             print(f'[wren_rag] failed to load syllabus data: {e}')
             self.chunks = []
-            self._doc_tokens = []
-            self._doc_title_tokens = []
-            self._subjects = {}
 
-    def _idf(self, word, bucket):
-        df = bucket['doc_freq'].get(word, 0)
+    def _idf(self, word):
+        df = self._doc_freq.get(word, 0)
         if df == 0:
             return 0.0
-        return math.log((bucket['n_docs'] + 1) / (df + 1)) + 1
+        return math.log((self._n_docs + 1) / (df + 1)) + 1
 
-    # Added on top of the plain BM25 body score. topic_title/section
-    # (and any hand-added 'keywords') are short, curated, human-written
-    # labels — a query word landing there is a far more reliable
-    # topical signal than the same word appearing once inside a long
-    # combined-topic body chunk, where BM25's own length-normalization
-    # can bury a genuine match under everything else packed into that
-    # chunk (e.g. a chemistry chunk titled "Non-metals and their
-    # compounds" bundles six unrelated substances into one document —
-    # a hit that's ALSO in the title is worth much more than a hit
-    # that's merely somewhere in 400+ words of body text). This bonus
-    # is deliberately flat (not IDF-weighted, not length-normalized) so
-    # it fires at full strength every time: a "simple" question that
-    # essentially repeats a topic's own name (the common case — e.g.
-    # "formula for centripetal force" naming a "Circular motion /
-    # centripetal force" topic almost verbatim) reliably clears
-    # _RAG_MIN_SCORE instead of depending on how that phrase happens to
-    # be worded in the body paragraph.
-    _TITLE_MATCH_BONUS = 3.0
-
-    def _score(self, query_tokens, doc_tokens, bucket, title_tokens=None):
+    def _score(self, query_tokens, doc_tokens):
         if not doc_tokens:
             return 0.0
         k1, b = 1.5, 0.75
         doc_counter = Counter(doc_tokens)
         doc_len = len(doc_tokens)
         score = 0.0
-        qset = set(query_tokens)
-        for word in qset:
+        for word in set(query_tokens):
             f = doc_counter.get(word, 0)
             if f == 0:
                 continue
-            idf = self._idf(word, bucket)
-            denom = f + k1 * (1 - b + b * doc_len / bucket['avg_doc_len'])
+            idf = self._idf(word)
+            denom = f + k1 * (1 - b + b * doc_len / self._avg_doc_len)
             score += idf * (f * (k1 + 1)) / denom
-        if title_tokens:
-            score += self._TITLE_MATCH_BONUS * len(qset & title_tokens)
         return score
 
-    def retrieve(self, query, subject=None, top_k=2, min_score=None):
-        if min_score is None:
-            min_score = _RAG_MIN_SCORE
+    def retrieve(self, query, subject=None, top_k=2):
         query_tokens = _rag_tokenize(query)
         if not query_tokens or not self.chunks:
             return []
-
-        if subject:
-            subj_key = subject.strip().lower()
-            bucket = self._subjects.get(subj_key)
-            buckets = {subj_key: bucket} if bucket else {}
-        else:
-            buckets = self._subjects
-
         scored = []
-        for bucket in buckets.values():
-            for i in bucket['doc_idxs']:
-                s = self._score(query_tokens, self._doc_tokens[i], bucket,
-                                 title_tokens=self._doc_title_tokens[i])
-                scored.append((i, s))
+        for i, doc_tokens in enumerate(self._doc_tokens):
+            if subject and self.chunks[i].get('subject', '').lower() != subject.lower():
+                continue
+            s = self._score(query_tokens, doc_tokens)
+            scored.append((i, s))
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [(self.chunks[i], s) for i, s in scored[:top_k] if s >= min_score]
+        return [(self.chunks[i], s) for i, s in scored[:top_k] if s >= _RAG_MIN_SCORE]
 
     def get_context_for(self, query, subject=None):
         results = self.retrieve(query, subject=subject)
 
         if not results:
-            # Visibility fix: previously there was no way to tell, from
-            # outside, whether grounding ran at all versus genuinely
-            # found nothing — this logs the query plus the best
-            # candidates it found even though none cleared the bar, so
-            # a look at the Render logs immediately shows whether it's
-            # a near-miss (useful for tuning _RAG_MIN_SCORE /
-            # _TITLE_MATCH_BONUS, or adding 'keywords' to a chunk) or a
-            # genuine gap in the loaded syllabus data.
-            near = self.retrieve(query, subject=subject, top_k=3, min_score=0.0)
-            near_desc = ', '.join(
-                f'{c["topic_title"]}={s:.2f}' for c, s in near
-            ) if near else 'no chunks scored above zero'
-            print(f'[wren_rag] NO MATCH  query={query!r} subject={subject!r} '
-                  f'threshold={_RAG_MIN_SCORE} closest: {near_desc}')
-            return (
-                "\n\n--- JAMB SYLLABUS GROUNDING: NO MATCH ---\n"
-                "No topic in the indexed JAMB syllabus data matched this "
-                "question closely enough to ground an answer. Tell the "
-                "student plainly that this isn't covered in the syllabus "
-                "topics currently loaded, rather than answering from "
-                "general knowledge as if it were syllabus-backed."
-            )
-
-        matched_desc = ', '.join(
-            f'{c["topic_title"]}={s:.2f}' for c, s in results)
-        print(f'[wren_rag] MATCH     query={query!r} subject={subject!r} -> {matched_desc}')
+            # No indexed topic matched closely enough. Returning '' (not
+            # a "NO MATCH" note) is deliberate: the caller's system
+            # prompt simply gets no grounding block appended, so the
+            # model has no signal that anything syllabus-related was
+            # even attempted — it just answers the question normally,
+            # the same way it would if the RAG feature didn't exist.
+            # This was previously a descriptive "NO MATCH" block that
+            # instructed the model to tell the student the topic wasn't
+            # covered — that produced confusing/wrong disclaimers for
+            # genuinely in-syllabus questions that simply used different
+            # wording than the syllabus text (e.g. "Planck's constant"
+            # vs. a syllabus chunk that only says "Einstein's equation"
+            # and "photoelectric effect" without ever using the word
+            # "Planck"). Silence is safer than a wrong disclaimer.
+            return ''
 
         parts = [
             "\n\n--- JAMB SYLLABUS GROUNDING: STRICT MODE ---\n"
