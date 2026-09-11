@@ -17,6 +17,31 @@ exactly like biology.json — a list of topic objects with at least:
 
 Then call reload_all() (or just restart the server) — no code changes
 needed. All *.json files in syllabus_data/ are loaded automatically.
+
+PER-SUBJECT STATISTICS (important)
+-----------------------------------
+BM25 scoring depends on corpus-wide statistics: how common a word is
+across all documents (document frequency, feeding into IDF) and the
+average document length. If those statistics are computed over ALL
+subjects pooled together, then loading a new subject changes the
+statistics used to score every OTHER subject's chunks too — a word
+that used to be rare (high IDF, strong signal) can look "common" once
+a second or third subject also uses it, quietly lowering scores for
+subjects that never changed at all. That's what was happening here:
+Biology matches stopped clearing the match threshold after Chemistry/
+Physics/etc. were added, even though nothing about Biology's own data
+changed.
+
+The fix: each subject gets its OWN document-frequency table, document
+count, and average document length, computed only from that subject's
+own chunks. Adding a tenth subject cannot change the first subject's
+scores, because the first subject's statistics never look outside its
+own chunks. When no subject filter is given, we score each chunk
+against its own subject's statistics and pool the results together
+for ranking — cross-subject comparability is inherently a bit fuzzier
+in that case (different subjects, different scales), but the far more
+common case — a query scored within one known subject — is now
+completely stable no matter how many other subjects get added later.
 """
 
 import os
@@ -70,43 +95,58 @@ def _load_all_subject_chunks(data_dir):
 
 
 class SyllabusRAG:
-    """Same BM25-style scorer as the on-device module. One instance
-    holds ALL subjects' chunks together — the /rag/context endpoint
-    filters by `subject` after retrieval so each subject still gets
-    its own focused index behavior."""
+    """BM25-style scorer with a SEPARATE statistics table per subject
+    (document frequency, document count, average document length).
+    Loading more subjects only ever adds new, independent tables — it
+    never touches the statistics an existing subject scores against."""
 
     def __init__(self, data_dir=DATA_DIR):
         self.chunks = []
         self._doc_tokens = []
-        self._doc_freq = Counter()
-        self._n_docs = 0
-        self._avg_doc_len = 1.0
+        # subject_lower -> {'doc_freq': Counter, 'doc_idxs': [i, ...],
+        #                    'n_docs': int, 'avg_doc_len': float}
+        self._subjects = {}
         self._load(data_dir)
 
     def _load(self, data_dir):
         try:
             self.chunks = _load_all_subject_chunks(data_dir)
             self._doc_tokens = []
-            self._doc_freq = Counter()
             for chunk in self.chunks:
-                tokens = _rag_tokenize(chunk.get('text', ''))
-                self._doc_tokens.append(tokens)
-                for word in set(tokens):
-                    self._doc_freq[word] += 1
-            self._n_docs = len(self.chunks)
-            if self._doc_tokens:
-                self._avg_doc_len = sum(len(t) for t in self._doc_tokens) / len(self._doc_tokens)
+                self._doc_tokens.append(_rag_tokenize(chunk.get('text', '')))
+
+            subjects = {}
+            for i, chunk in enumerate(self.chunks):
+                subj_key = chunk.get('subject', '').strip().lower()
+                if not subj_key:
+                    continue
+                bucket = subjects.setdefault(subj_key, {
+                    'doc_freq': Counter(), 'doc_idxs': [], 'total_len': 0,
+                })
+                bucket['doc_idxs'].append(i)
+                bucket['total_len'] += len(self._doc_tokens[i])
+                for word in set(self._doc_tokens[i]):
+                    bucket['doc_freq'][word] += 1
+
+            for bucket in subjects.values():
+                n = len(bucket['doc_idxs'])
+                bucket['n_docs'] = n
+                bucket['avg_doc_len'] = (bucket['total_len'] / n) if n else 1.0
+
+            self._subjects = subjects
         except Exception as e:
             print(f'[wren_rag] failed to load syllabus data: {e}')
             self.chunks = []
+            self._doc_tokens = []
+            self._subjects = {}
 
-    def _idf(self, word):
-        df = self._doc_freq.get(word, 0)
+    def _idf(self, word, bucket):
+        df = bucket['doc_freq'].get(word, 0)
         if df == 0:
             return 0.0
-        return math.log((self._n_docs + 1) / (df + 1)) + 1
+        return math.log((bucket['n_docs'] + 1) / (df + 1)) + 1
 
-    def _score(self, query_tokens, doc_tokens):
+    def _score(self, query_tokens, doc_tokens, bucket):
         if not doc_tokens:
             return 0.0
         k1, b = 1.5, 0.75
@@ -117,8 +157,8 @@ class SyllabusRAG:
             f = doc_counter.get(word, 0)
             if f == 0:
                 continue
-            idf = self._idf(word)
-            denom = f + k1 * (1 - b + b * doc_len / self._avg_doc_len)
+            idf = self._idf(word, bucket)
+            denom = f + k1 * (1 - b + b * doc_len / bucket['avg_doc_len'])
             score += idf * (f * (k1 + 1)) / denom
         return score
 
@@ -126,12 +166,19 @@ class SyllabusRAG:
         query_tokens = _rag_tokenize(query)
         if not query_tokens or not self.chunks:
             return []
+
+        if subject:
+            subj_key = subject.strip().lower()
+            bucket = self._subjects.get(subj_key)
+            buckets = {subj_key: bucket} if bucket else {}
+        else:
+            buckets = self._subjects
+
         scored = []
-        for i, doc_tokens in enumerate(self._doc_tokens):
-            if subject and self.chunks[i].get('subject', '').lower() != subject.lower():
-                continue
-            s = self._score(query_tokens, doc_tokens)
-            scored.append((i, s))
+        for bucket in buckets.values():
+            for i in bucket['doc_idxs']:
+                s = self._score(query_tokens, self._doc_tokens[i], bucket)
+                scored.append((i, s))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [(self.chunks[i], s) for i, s in scored[:top_k] if s >= _RAG_MIN_SCORE]
 
