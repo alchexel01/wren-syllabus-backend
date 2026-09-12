@@ -11,6 +11,7 @@ Run locally:
 Endpoints:
     GET  /health                     — liveness check
     GET  /subjects                   — list loaded subjects
+    GET  /exam-bodies                — list exam bodies with data loaded, each with its subjects
     POST /rag/context                — get grounding text for a query
     POST /admin/reload               — re-scan syllabus_data/ (needs API key)
     POST /premium/initialize         — start a Paystack transaction, get checkout URL
@@ -302,6 +303,15 @@ def health():
 @app.get("/subjects")
 def subjects():
     return {"subjects": rag_engine.list_subjects()}
+
+
+@app.get("/exam-bodies")
+def exam_bodies():
+    """One entry per exam body that actually has syllabus data loaded
+    (e.g. JAMB), each with the subjects available for it. An exam body
+    with no chunks loaded simply doesn't appear — the client renders
+    whatever comes back as-is, no "coming soon" placeholder needed."""
+    return {"exam_bodies": rag_engine.list_exam_bodies()}
 
 
 @app.post("/rag/context", response_model=ContextResponse)
