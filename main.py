@@ -11,6 +11,7 @@ Run locally:
 Endpoints:
     GET  /health                     — liveness check
     GET  /subjects                   — list loaded subjects
+    GET  /exam-bodies                — list exam bodies with their available subjects
     POST /rag/context                — get grounding text for a query
     POST /admin/reload               — re-scan syllabus_data/ (needs API key)
     POST /premium/initialize         — start a Paystack transaction, get checkout URL
@@ -30,6 +31,7 @@ See README.md for deployment and how AI.py should call this.
 
 import os
 import sys
+import json
 import time
 import uuid
 import logging
@@ -207,6 +209,53 @@ def health():
 @app.get("/subjects")
 def subjects():
     return {"subjects": rag_engine.list_subjects()}
+
+
+SYLLABUS_DIR = os.path.join(os.path.dirname(__file__), "syllabus_data")
+
+
+@app.get("/exam-bodies")
+def exam_bodies():
+    """Groups syllabus_data/*.json by their "exam_body" field so the
+    client can search "which exam bodies do you have data for, and what
+    subjects". An exam body with no JSON files here simply never appears
+    in the response — adding a new one (e.g. WAEC) just means dropping
+    its JSON files into syllabus_data/ with "exam_body": "WAEC" set; no
+    code change is needed here.
+
+    Response shape:
+    {
+      "exam_bodies": [
+        {"name": "JAMB", "subjects": ["Biology", "Chemistry", ...]}
+      ]
+    }
+    """
+    bodies = {}
+
+    if os.path.isdir(SYLLABUS_DIR):
+        for fname in os.listdir(SYLLABUS_DIR):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(SYLLABUS_DIR, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            if not data:
+                continue
+
+            first = data[0]
+            subject = first.get("subject") or fname[:-5].replace("_", " ").title()
+            exam_body = first.get("exam_body") or "JAMB"
+
+            bodies.setdefault(exam_body, set()).add(subject)
+
+    result = [
+        {"name": name, "subjects": sorted(subjects)}
+        for name, subjects in sorted(bodies.items())
+    ]
+    return {"exam_bodies": result}
 
 
 @app.post("/rag/context", response_model=ContextResponse)
