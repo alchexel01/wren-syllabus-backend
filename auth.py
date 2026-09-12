@@ -22,12 +22,18 @@ Flow:
        keys everything off email, so nothing downstream needs to
        change).
 
-Storage: in-memory dict, NOT Postgres. Unlike premium status, a login
-session is only needed for a few minutes while the user is mid-flow —
-it doesn't need to survive a redeploy, and every session is deleted
-right after the app collects it (or expires on its own). If you scale
-to multiple backend instances this dict won't be shared between them;
-fine for a single Render instance, worth revisiting if you add more.
+Storage: Postgres (DATABASE_URL env var), same pool pattern as
+premium.py. This used to be an in-memory dict — fine in theory since
+a login session only lives a few minutes — but an in-memory dict is
+only shared within a single process. The moment Render runs more than
+one worker/instance (or restarts between /start and the browser
+callback), /start and /callback/status can land on different
+processes that never heard of each other's sessions, so the app polls
+forever and the sign-in silently never completes. Postgres fixes that
+the same way it fixed premium persistence: one shared store every
+process reads from, regardless of which process handled which
+request. Expired/collected rows are just deleted, so the table never
+grows unbounded.
 
 Env vars required (Render dashboard, same place as the others):
     GOOGLE_CLIENT_ID       — from the Web application OAuth client
@@ -38,13 +44,14 @@ Env vars required (Render dashboard, same place as the others):
 """
 
 import os
-import time
 import logging
 import secrets
+import datetime as dt
 from urllib.parse import urlencode
 from typing import Optional
 
 import httpx
+import asyncpg
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -65,21 +72,47 @@ GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 # Google's account picker for a while.
 SESSION_TTL_SECONDS = 10 * 60
 
-# session_id -> {"email": str, "created_at": float} once the callback
-# lands. Sessions that never complete are just never inserted here —
-# _purge_expired() below only needs to clean up completed-but-uncollected
-# ones plus anything that's aged out.
-_sessions: dict[str, dict] = {}
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+_pool = None
 
 _google_request = google_requests.Request()
 
 
-def _purge_expired():
-    now = time.time()
-    expired = [sid for sid, v in _sessions.items()
-               if now - v["created_at"] > SESSION_TTL_SECONDS]
-    for sid in expired:
-        del _sessions[sid]
+async def init_db():
+    global _pool
+    if not DATABASE_URL:
+        log.error("[auth] DATABASE_URL not set - google sign-in endpoints will fail")
+        return
+    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS auth_sessions ("
+            "session_id TEXT PRIMARY KEY, "
+            "email TEXT NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL"
+            ")"
+        )
+    log.info("[auth] DB pool ready, table ensured")
+
+
+async def close_db():
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+
+
+def _require_pool(rid):
+    if _pool is None:
+        log.error(f"[{rid}] /auth/google: DB pool not initialized (DATABASE_URL missing?)")
+        raise HTTPException(status_code=500,
+                             detail={"error": "server missing DATABASE_URL", "request_id": rid})
+
+
+async def _purge_expired(conn):
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=SESSION_TTL_SECONDS)
+    await conn.execute("DELETE FROM auth_sessions WHERE created_at < $1", cutoff)
 
 
 def _require_config(rid):
@@ -106,13 +139,15 @@ class AuthStatusResponse(BaseModel):
     email: Optional[str] = None
 
 
-def auth_google_start(rid: str) -> AuthStartResponse:
+async def auth_google_start(rid: str) -> AuthStartResponse:
     """Called by the app before opening the browser. Mints a fresh
     session_id and builds the Google consent-screen URL around it, so
     the Client ID/redirect URI live here on the backend rather than
     being hardcoded into the app (easier to rotate later)."""
     _require_config(rid)
-    _purge_expired()
+    _require_pool(rid)
+    async with _pool.acquire() as conn:
+        await _purge_expired(conn)
 
     session_id = secrets.token_urlsafe(24)
     params = {
@@ -138,7 +173,7 @@ async def auth_google_callback(code: str, state: str, rid: str) -> HTMLResponse:
     verified email under the session_id (Google's 'state' param) for
     the app to pick up via polling."""
     _require_config(rid)
-    _purge_expired()
+    _require_pool(rid)
 
     session_id = state
     if not session_id:
@@ -191,23 +226,38 @@ async def auth_google_callback(code: str, state: str, rid: str) -> HTMLResponse:
         log.error(f"[{rid}] /auth/google/callback: verified token had no email claim")
         return _result_page("Sign-in failed. Please return to the app and try again.", ok=False)
 
-    _sessions[session_id] = {"email": email, "created_at": time.time()}
+    now = dt.datetime.now(dt.timezone.utc)
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO auth_sessions (session_id, email, created_at) "
+            "VALUES ($1, $2, $3) "
+            "ON CONFLICT (session_id) DO UPDATE SET "
+            "email = EXCLUDED.email, created_at = EXCLUDED.created_at",
+            session_id, email, now,
+        )
     log.info(f"[{rid}] /auth/google/callback: session_id={session_id[:8]}... "
              f"verified email={email}")
     return _result_page("You're signed in. You can close this tab and return to Wren.", ok=True)
 
 
-def auth_google_status(session_id: str, rid: str) -> AuthStatusResponse:
+async def auth_google_status(session_id: str, rid: str) -> AuthStatusResponse:
     """Polled by the app after it opens the browser. Returns the
     verified email once the callback above has landed, then the
-    session is consumed (deleted) so it can't be polled/reused again."""
-    _purge_expired()
-    session = _sessions.get(session_id)
-    if not session:
+    session is consumed (deleted) so it can't be polled/reused again.
+    Reading from Postgres here (instead of an in-process dict) is what
+    makes this work no matter which worker/instance handled /start,
+    /callback, or this poll — they all see the same row."""
+    _require_pool(rid)
+    async with _pool.acquire() as conn:
+        await _purge_expired(conn)
+        row = await conn.fetchrow(
+            "DELETE FROM auth_sessions WHERE session_id = $1 "
+            "RETURNING email", session_id)
+
+    if not row:
         return AuthStatusResponse(done=False)
 
-    email = session["email"]
-    del _sessions[session_id]  # one-shot: collected exactly once
+    email = row["email"]
     log.info(f"[{rid}] /auth/google/status: session_id={session_id[:8]}... "
              f"collected email={email}")
     return AuthStatusResponse(done=True, email=email)
