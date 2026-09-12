@@ -38,6 +38,27 @@ _RAG_STOPWORDS = {
     'could', 'would', 'should', 'about', 'into', 'than', 'then', 'also',
     'each', 'other', 'some', 'such', 'not', 'you', 'your', 'his', 'her',
     'she', 'him', 'its', 'our', 'ours', 'may', 'these', 'those',
+    # Bloom's-taxonomy-style instructional/skill verbs. These show up
+    # constantly in the "objectives" half of every syllabus chunk
+    # ("Candidates should be able to: i. explain... ii. determine...")
+    # and in how students phrase their own questions ("explain X",
+    # "describe Y"). Because different topics happen to use different
+    # synonyms for "explain," a word like this can appear in only a
+    # handful of chunks — which makes BM25 treat it as a RARE, highly
+    # distinctive word (high idf) even though it carries no topical
+    # meaning at all. Left unfiltered, this let "explain magnetism"
+    # get pulled toward an unrelated topic that simply happened to use
+    # the word "explain" in its objectives, instead of the topic
+    # actually about magnetism. These add no value for matching a
+    # question to a topic, so they're filtered the same as "the"/"and".
+    'explain', 'describe', 'define', 'discuss', 'state', 'outline',
+    'identify', 'determine', 'specify', 'distinguish', 'differentiate',
+    'illustrate', 'calculate', 'compare', 'contrast', 'derive',
+    'analyse', 'analyze', 'evaluate', 'interpret', 'relate', 'deduce',
+    'demonstrate', 'apply', 'construct', 'solve', 'perform', 'give',
+    'list', 'mention', 'show', 'prove', 'justify', 'classify',
+    'summarize', 'summarise', 'elaborate', 'clarify', 'recognize',
+    'recognise', 'able', 'candidate', 'candidates',
 }
 
 
@@ -112,17 +133,34 @@ class SyllabusRAG:
         k1, b = 1.5, 0.75
         doc_counter = Counter(doc_tokens)
         doc_len = len(doc_tokens)
+        unique_query_terms = set(query_tokens)
+        if not unique_query_terms:
+            return 0.0
         score = 0.0
-        for word in set(query_tokens):
+        matched_terms = 0
+        for word in unique_query_terms:
             f = doc_counter.get(word, 0)
             if f == 0:
                 continue
+            matched_terms += 1
             idf = self._idf(word)
             denom = f + k1 * (1 - b + b * doc_len / self._avg_doc_len)
             score += idf * (f * (k1 + 1)) / denom
-        return score
+        # Coordination factor: a chunk matching every distinct query
+        # word must outrank one that only matches a subset — without
+        # this, a short chunk that happens to repeat one common query
+        # word several times (e.g. "process" appearing 3x in a short
+        # "Gas Laws" entry) can outscore a much longer chunk that
+        # actually contains the rare, specific word the student asked
+        # about (e.g. "solvay") plus that same common word fewer times.
+        # That exact case — "solvay process" ranking Gas Laws above the
+        # chunk that actually explains the Solvay process — is why this
+        # is here. Scaling by the fraction of query terms matched fixes
+        # it without changing the underlying per-term BM25 weighting.
+        coord = matched_terms / len(unique_query_terms)
+        return score * coord
 
-    def retrieve(self, query, subject=None, top_k=2):
+    def retrieve(self, query, subject=None, top_k=2, min_relative=0.4):
         query_tokens = _rag_tokenize(query)
         if not query_tokens or not self.chunks:
             return []
@@ -133,7 +171,18 @@ class SyllabusRAG:
             s = self._score(query_tokens, doc_tokens)
             scored.append((i, s))
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [(self.chunks[i], s) for i, s in scored[:top_k] if s >= _RAG_MIN_SCORE]
+        results = [(i, s) for i, s in scored[:top_k] if s >= _RAG_MIN_SCORE]
+        if not results:
+            return []
+        # Once there's a clearly-best match, don't pad the grounding
+        # block with a second, much weaker one just to fill top_k — an
+        # unrelated second chunk is more likely to confuse the model
+        # (it has to reconcile two "matched" topics, one irrelevant)
+        # than to help it, and confusion here is exactly what produces
+        # wrongly-declared "outside the syllabus" answers.
+        top_score = results[0][1]
+        results = [(i, s) for i, s in results if s >= top_score * min_relative]
+        return [(self.chunks[i], s) for i, s in results]
 
     def get_context_for(self, query, subject=None):
         results = self.retrieve(query, subject=subject)
@@ -156,23 +205,23 @@ class SyllabusRAG:
             return ''
 
         parts = [
-            "\n\n--- JAMB SYLLABUS GROUNDING: STRICT MODE ---\n"
+            "\n\n--- JAMB SYLLABUS GROUNDING ---\n"
             "The following syllabus topic(s) matched the student's question. "
-            "You MUST follow these rules:\n"
-            "1. Answer using ONLY the scope, terminology, and depth given "
-            "under 'Syllabus scope' and 'Exam objectives' below — do not "
-            "introduce concepts, examples, or terminology outside what is "
-            "listed, even if they are correct, unless the student "
-            "explicitly asks to go beyond the syllabus.\n"
+            "Follow these rules:\n"
+            "1. Ground your answer in the scope, terminology, and depth given "
+            "under 'Syllabus scope' and 'Exam objectives' below when they "
+            "cover what was asked. This is reference material to answer "
+            "accurately from, not a whitelist — if the student's question "
+            "goes beyond what's shown here, answer that part fully from "
+            "your own knowledge too. Never tell the student a part of "
+            "their question is unavailable, excluded, not covered, or "
+            "outside the syllabus — if it's not in the material below, "
+            "just answer it normally, the same way you would if this "
+            "syllabus-grounding feature didn't exist.\n"
             "2. Explicitly name the exam body, subject, and topic you are "
             "answering from (e.g. \"According to the JAMB Biology syllabus, "
-            "Topic 5: Nutrition...\") at or near the start of your answer.\n"
-            "3. If the student's question only partially overlaps the "
-            "matched topic(s) below, answer the overlapping part from the "
-            "syllabus and explicitly flag which part of the question falls "
-            "outside the indexed syllabus scope.\n"
-            "4. Do not soften or hedge this grounding — this is a strict "
-            "instruction, not a suggestion."
+            "Topic 5: Nutrition...\") at or near the start of your answer, "
+            "then move straight into the substance with no further preamble."
         ]
         for chunk, score in results:
             parts.append(
