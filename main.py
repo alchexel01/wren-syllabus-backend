@@ -22,6 +22,10 @@ Endpoints:
     GET  /auth/google/start          — get a Google sign-in URL + session_id
     GET  /auth/google/callback       — Google redirects here after sign-in
     GET  /auth/google/status/{id}    — poll: has this session's sign-in completed?
+    POST /chats/save                 — upsert one chat for an email
+    GET  /chats/{email}              — fetch every chat saved for an email
+    DELETE /chats/{email}/{chat_id}  — delete one chat
+    DELETE /chats/{email}            — delete every chat for an email
     POST /chat                       — proxies to Groq chat completions
     POST /transcribe                 — proxies to Groq Whisper transcription
     GET  /model/{key}                — streams an offline model file from HF
@@ -45,6 +49,7 @@ import httpx
 import rag_engine
 import premium
 import auth
+import chat_history
 
 app = FastAPI(title="Wren Syllabus Backend", version="1.0")
 
@@ -52,11 +57,13 @@ app = FastAPI(title="Wren Syllabus Backend", version="1.0")
 @app.on_event("startup")
 async def _startup():
     await premium.init_db()
+    await chat_history.init_db()
 
 
 @app.on_event("shutdown")
 async def _shutdown():
     await premium.close_db()
+    await chat_history.close_db()
 
 # ── Error / crash logging ────────────────────────────────────────────────
 # Every request gets a short request_id. It's included in:
@@ -430,6 +437,57 @@ def auth_google_status_route(session_id: str, req: Request, x_app_secret: str = 
     rid = req.state.rid
     _check_app_secret(x_app_secret, rid)
     return auth.auth_google_status(session_id, rid)
+
+
+# ── Chat history (email-scoped sync) ─────────────────────────────────────
+# Ties every saved conversation to the signed-in email, same identity
+# model as premium above. See chat_history.py for the full design
+# notes and why Postgres (not this service's own disk) is the store
+# of record.
+
+@app.post("/chats/save", response_model=chat_history.OkResponse)
+async def chats_save_route(
+    payload: chat_history.ChatSaveRequest,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await chat_history.chats_save(payload, rid)
+
+
+@app.get("/chats/{email}", response_model=chat_history.ChatListResponse)
+async def chats_list_route(
+    email: str,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await chat_history.chats_list(email, rid)
+
+
+@app.delete("/chats/{email}/{chat_id}", response_model=chat_history.OkResponse)
+async def chat_delete_route(
+    email: str,
+    chat_id: str,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await chat_history.chat_delete(email, chat_id, rid)
+
+
+@app.delete("/chats/{email}", response_model=chat_history.OkResponse)
+async def chats_delete_all_route(
+    email: str,
+    req: Request,
+    x_app_secret: str = Header(default=""),
+):
+    rid = req.state.rid
+    _check_app_secret(x_app_secret, rid)
+    return await chat_history.chats_delete_all(email, rid)
 
 
 @app.post("/chat")
