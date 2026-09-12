@@ -234,6 +234,27 @@ class SyllabusRAG:
     def list_subjects(self):
         return sorted({c.get('subject', '') for c in self.chunks if c.get('subject')})
 
+    def list_exam_bodies(self):
+        """Groups loaded chunks by their `exam_body` field, returning
+        one entry per exam body actually present in the loaded syllabus
+        data, each with its own sorted, de-duplicated subject list.
+        An exam body with zero chunks loaded simply never appears here
+        — that's what lets the client render an "AVAILABLE" badge
+        without a separate allow-list of exam bodies to maintain."""
+        by_body = {}
+        for c in self.chunks:
+            body = (c.get('exam_body') or '').strip()
+            subject = c.get('subject')
+            if not body:
+                continue
+            by_body.setdefault(body, set())
+            if subject:
+                by_body[body].add(subject)
+        return [
+            {'name': name, 'subjects': sorted(subjects)}
+            for name, subjects in sorted(by_body.items())
+        ]
+
 
 # ── Single shared instance + reload support ──────────────────────────────
 # A lock guards reload_all() so an in-flight request never reads a
@@ -259,3 +280,8 @@ def get_context_for(query, subject=None):
 def list_subjects():
     with _lock:
         return syllabus_rag.list_subjects()
+
+
+def list_exam_bodies():
+    with _lock:
+        return syllabus_rag.list_exam_bodies()
