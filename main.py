@@ -11,7 +11,6 @@ Run locally:
 Endpoints:
     GET  /health                     — liveness check
     GET  /subjects                   — list loaded subjects
-    GET  /exam-bodies                — list exam bodies with their available subjects
     POST /rag/context                — get grounding text for a query
     POST /admin/reload               — re-scan syllabus_data/ (needs API key)
     POST /premium/initialize         — start a Paystack transaction, get checkout URL
@@ -31,9 +30,9 @@ See README.md for deployment and how AI.py should call this.
 
 import os
 import sys
-import json
 import time
 import uuid
+import asyncio
 import logging
 import traceback
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Form
@@ -137,14 +136,108 @@ ADMIN_KEY = os.environ.get("WREN_ADMIN_KEY", "")
 APP_SECRET = os.environ.get("WREN_APP_SECRET", "").strip()
 
 # Real provider credentials. These never leave the server.
-# Add GROQ_API_KEY_2, _3, etc. on Render if you want multiple keys in
-# rotation — only _1 is wired up below; extend _groq_key() if/when you
-# actually add more and want round-robin/failover behavior.
-GROQ_API_KEY_1 = os.environ.get("GROQ_API_KEY_1", "")
+#
+# Preferred: set GROQ_API_KEYS on Render to a comma-separated list of
+# every key you have — "key_one,key_two,key_three". To add an 11th
+# key later, just add it to this list and restart the Render service;
+# no code change needed.
+#
+# Also supported for backwards compatibility: individually numbered
+# GROQ_API_KEY_1, GROQ_API_KEY_2, ... vars (gaps are fine). Any keys
+# found this way are merged in with GROQ_API_KEYS, de-duplicated.
+GROQ_API_KEYS_ENV_NAME = "GROQ_API_KEYS"
+GROQ_API_KEY_NUMBERED_ENV_NAMES = [f"GROQ_API_KEY_{i}" for i in range(1, 11)]
 HF_ACCESS_TOKEN = os.environ.get("HF_ACCESS_TOKEN", "")
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+
+class GroqKeyPool:
+    """Sticky round-robin pool over any number of Groq API keys.
+
+    "Sticky" means we keep using the same key across requests until it
+    actually fails — we don't shuffle keys on every request for no
+    reason. When a key comes back 429 (rate limited) or 401/403 (bad/
+    revoked key), that key is put on a cooldown timer and we instantly
+    advance to the next live key, so a single exhausted key never
+    stalls the app — it just quietly keeps going on the next one.
+    """
+
+    # How long to skip a key that just got rate-limited, if Groq didn't
+    # tell us via Retry-After. Long enough to matter, short enough that
+    # a key that recovers isn't left idle for the rest of the day.
+    DEFAULT_COOLDOWN_SECS = 60.0
+    # 401/403 usually means the key itself is bad (revoked/typo'd), not
+    # a transient limit — cool it down much longer so we don't keep
+    # hammering a dead key every rotation.
+    AUTH_FAILURE_COOLDOWN_SECS = 3600.0
+
+    def __init__(self, list_env_name: str, numbered_env_names: list[str]):
+        self.keys: list[str] = []
+        seen: set[str] = set()
+
+        # Primary source: one comma-separated env var. Adding a new
+        # key later is just "edit this env var, restart" — no touching
+        # this file.
+        raw = os.environ.get(list_env_name, "")
+        for part in raw.split(","):
+            val = part.strip()
+            if val and val not in seen:
+                self.keys.append(val)
+                seen.add(val)
+
+        # Back-compat source: individually numbered vars, merged in on
+        # top of anything already found above.
+        for name in numbered_env_names:
+            val = os.environ.get(name, "").strip()
+            if val and val not in seen:
+                self.keys.append(val)
+                seen.add(val)
+
+        self._idx = 0
+        self._cooldown_until: dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    def __len__(self):
+        return len(self.keys)
+
+    async def current(self) -> Optional[str]:
+        """Return a currently-usable key without advancing the pool."""
+        async with self._lock:
+            return self._pick_locked()
+
+    def _pick_locked(self) -> Optional[str]:
+        if not self.keys:
+            return None
+        now = time.time()
+        n = len(self.keys)
+        # Prefer the key at self._idx if it's live; otherwise scan
+        # forward for the next one that's off cooldown.
+        for offset in range(n):
+            idx = (self._idx + offset) % n
+            key = self.keys[idx]
+            if self._cooldown_until.get(key, 0.0) <= now:
+                self._idx = idx
+                return key
+        # Every key is cooling down (e.g. all 10 rate-limited at once)
+        # — fall back to whichever one recovers soonest rather than
+        # failing outright.
+        soonest = min(self.keys, key=lambda k: self._cooldown_until.get(k, 0.0))
+        self._idx = self.keys.index(soonest)
+        return soonest
+
+    async def advance(self, bad_key: Optional[str] = None, cooldown_secs: Optional[float] = None):
+        """Mark `bad_key` as cooling down and move on to the next key."""
+        async with self._lock:
+            if bad_key is not None and cooldown_secs is not None:
+                self._cooldown_until[bad_key] = time.time() + cooldown_secs
+            if self.keys:
+                self._idx = (self._idx + 1) % len(self.keys)
+
+
+groq_pool = GroqKeyPool(GROQ_API_KEYS_ENV_NAME, GROQ_API_KEY_NUMBERED_ENV_NAMES)
+log.info(f"[startup] Groq key pool: {len(groq_pool)} key(s) loaded")
 
 # Registry of offline model files the app can download. Mirrors
 # OFFLINE_MODELS in AI.py — add entries here if you add them there.
@@ -209,53 +302,6 @@ def health():
 @app.get("/subjects")
 def subjects():
     return {"subjects": rag_engine.list_subjects()}
-
-
-SYLLABUS_DIR = os.path.join(os.path.dirname(__file__), "syllabus_data")
-
-
-@app.get("/exam-bodies")
-def exam_bodies():
-    """Groups syllabus_data/*.json by their "exam_body" field so the
-    client can search "which exam bodies do you have data for, and what
-    subjects". An exam body with no JSON files here simply never appears
-    in the response — adding a new one (e.g. WAEC) just means dropping
-    its JSON files into syllabus_data/ with "exam_body": "WAEC" set; no
-    code change is needed here.
-
-    Response shape:
-    {
-      "exam_bodies": [
-        {"name": "JAMB", "subjects": ["Biology", "Chemistry", ...]}
-      ]
-    }
-    """
-    bodies = {}
-
-    if os.path.isdir(SYLLABUS_DIR):
-        for fname in os.listdir(SYLLABUS_DIR):
-            if not fname.endswith(".json"):
-                continue
-            path = os.path.join(SYLLABUS_DIR, fname)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            if not data:
-                continue
-
-            first = data[0]
-            subject = first.get("subject") or fname[:-5].replace("_", " ").title()
-            exam_body = first.get("exam_body") or "JAMB"
-
-            bodies.setdefault(exam_body, set()).add(subject)
-
-    result = [
-        {"name": name, "subjects": sorted(subjects)}
-        for name, subjects in sorted(bodies.items())
-    ]
-    return {"exam_bodies": result}
 
 
 @app.post("/rag/context", response_model=ContextResponse)
@@ -395,81 +441,122 @@ async def chat(request: dict, req: Request, x_app_secret: str = Header(default="
     """
     rid = req.state.rid
     _check_app_secret(x_app_secret, rid)
-    if not GROQ_API_KEY_1:
-        log.error(f"[{rid}] /chat: server missing GROQ_API_KEY_1")
+    if not len(groq_pool):
+        log.error(f"[{rid}] /chat: server has no Groq API keys configured")
         raise HTTPException(status_code=500,
-                             detail={"error": "server missing GROQ_API_KEY_1", "request_id": rid})
+                             detail={"error": "server missing Groq API keys", "request_id": rid})
 
     is_streaming_req = bool(request.get("stream"))
     model = request.get("model", "?")
     log.info(f"[{rid}] /chat: model={model} stream={is_streaming_req}")
 
-    client = httpx.AsyncClient(timeout=httpx.Timeout(30, read=60))
-    try:
-        upstream_req = client.build_request(
-            "POST", GROQ_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY_1}",
-                "Content-Type": "application/json",
-            },
-            json=request,
-        )
-        upstream = await client.send(upstream_req, stream=True)
-    except httpx.RequestError as e:
-        await client.aclose()
-        log.error(f"[{rid}] /chat: upstream (Groq) request failed: {e!r}")
-        raise HTTPException(
-            status_code=502,
-            detail={"error": f"upstream request failed: {e}",
-                    "source": "groq", "request_id": rid},
-        )
+    # Try every key in the pool before giving up. A key that's rate
+    # limited or rejected gets cooled down and we instantly move to the
+    # next one — the caller never sees the individual key failures,
+    # only the final success or (if every key is down) the final error.
+    attempts = len(groq_pool)
+    last_status = 502
+    last_body_text = "all Groq API keys exhausted"
 
-    if upstream.status_code != 200:
-        # Read the body BEFORE closing, so the actual reason Groq gave
-        # (bad model name, invalid param, rate limit, auth, etc.) is
-        # logged and returned instead of a bare status code.
-        body = await upstream.aread()
-        await upstream.aclose()
-        await client.aclose()
-        body_text = body.decode("utf-8", errors="replace")[:1000]
-        log.error(
-            f"[{rid}] /chat: Groq returned HTTP {upstream.status_code}: {body_text}"
-        )
-        raise HTTPException(
-            status_code=upstream.status_code,
-            detail={"error": body_text, "source": "groq", "request_id": rid},
-        )
-
-    async def _stream():
-        chunk_count = 0
-        byte_count = 0
+    for attempt in range(1, attempts + 1):
+        key = await groq_pool.current()
+        client = httpx.AsyncClient(timeout=httpx.Timeout(30, read=60))
         try:
-            async for chunk in upstream.aiter_bytes():
-                chunk_count += 1
-                byte_count += len(chunk)
-                yield chunk
-        except Exception as e:
-            # A failure mid-stream (Groq connection dropped, read
-            # timeout, etc.) after the 200 status and headers have
-            # already been sent to the client — we can no longer
-            # change the HTTP status at this point, so log it loudly
-            # server-side; the client sees this as a stream that ended
-            # without a [DONE] sentinel (AI.py already detects and
-            # logs that case itself as 'Chat/stream').
-            log.error(
-                f"[{rid}] /chat: stream broke after {chunk_count} chunks "
-                f"({byte_count} bytes): {type(e).__name__}: {e}"
+            upstream_req = client.build_request(
+                "POST", GROQ_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                json=request,
             )
-        finally:
-            log.info(f"[{rid}] /chat: stream finished — {chunk_count} chunks, {byte_count} bytes")
+            upstream = await client.send(upstream_req, stream=True)
+        except httpx.RequestError as e:
+            await client.aclose()
+            log.error(f"[{rid}] /chat: key #{attempt}/{attempts} network error: {e!r}")
+            last_status, last_body_text = 502, f"upstream request failed: {e}"
+            await groq_pool.advance()
+            continue
+
+        if upstream.status_code == 429 or upstream.status_code in (401, 403):
+            body = await upstream.aread()
             await upstream.aclose()
             await client.aclose()
+            body_text = body.decode("utf-8", errors="replace")[:1000]
+            cooldown = GroqKeyPool.DEFAULT_COOLDOWN_SECS
+            if upstream.status_code == 429:
+                retry_after = upstream.headers.get("retry-after")
+                if retry_after and retry_after.strip().isdigit():
+                    cooldown = float(retry_after)
+            else:
+                cooldown = GroqKeyPool.AUTH_FAILURE_COOLDOWN_SECS
+            log.warning(
+                f"[{rid}] /chat: key #{attempt}/{attempts} hit HTTP "
+                f"{upstream.status_code} — cooling it down {cooldown:.0f}s and "
+                f"rotating to next key: {body_text}"
+            )
+            last_status, last_body_text = upstream.status_code, body_text
+            await groq_pool.advance(bad_key=key, cooldown_secs=cooldown)
+            continue
 
-    return StreamingResponse(
-        _stream(),
-        status_code=200,
-        media_type=upstream.headers.get("content-type", "text/event-stream"),
-        headers={"X-Request-ID": rid},
+        if upstream.status_code != 200:
+            # Not a key/limit issue (bad model name, invalid param,
+            # etc.) — another key won't fix this, so fail immediately
+            # instead of burning through the whole pool.
+            body = await upstream.aread()
+            await upstream.aclose()
+            await client.aclose()
+            body_text = body.decode("utf-8", errors="replace")[:1000]
+            log.error(
+                f"[{rid}] /chat: Groq returned HTTP {upstream.status_code}: {body_text}"
+            )
+            raise HTTPException(
+                status_code=upstream.status_code,
+                detail={"error": body_text, "source": "groq", "request_id": rid},
+            )
+
+        # Success on this key.
+        if attempt > 1:
+            log.info(f"[{rid}] /chat: succeeded on key #{attempt}/{attempts} after failover")
+
+        async def _stream(client=client, upstream=upstream):
+            chunk_count = 0
+            byte_count = 0
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    chunk_count += 1
+                    byte_count += len(chunk)
+                    yield chunk
+            except Exception as e:
+                # A failure mid-stream (Groq connection dropped, read
+                # timeout, etc.) after the 200 status and headers have
+                # already been sent to the client — we can no longer
+                # change the HTTP status or switch keys at this point,
+                # so log it loudly server-side; the client sees this as
+                # a stream that ended without a [DONE] sentinel (AI.py
+                # already detects and logs that case itself as
+                # 'Chat/stream').
+                log.error(
+                    f"[{rid}] /chat: stream broke after {chunk_count} chunks "
+                    f"({byte_count} bytes): {type(e).__name__}: {e}"
+                )
+            finally:
+                log.info(f"[{rid}] /chat: stream finished — {chunk_count} chunks, {byte_count} bytes")
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            _stream(),
+            status_code=200,
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+            headers={"X-Request-ID": rid},
+        )
+
+    # Every key in the pool failed.
+    log.error(f"[{rid}] /chat: exhausted all {attempts} Groq keys — last error: {last_body_text}")
+    raise HTTPException(
+        status_code=last_status if last_status not in (429, 401, 403) else 429,
+        detail={"error": last_body_text, "source": "groq", "request_id": rid},
     )
 
 
@@ -486,39 +573,69 @@ async def transcribe(
     the app reads resp.text.strip() directly."""
     rid = req.state.rid
     _check_app_secret(x_app_secret, rid)
-    if not GROQ_API_KEY_1:
-        log.error(f"[{rid}] /transcribe: server missing GROQ_API_KEY_1")
+    if not len(groq_pool):
+        log.error(f"[{rid}] /transcribe: server has no Groq API keys configured")
         raise HTTPException(status_code=500,
-                             detail={"error": "server missing GROQ_API_KEY_1", "request_id": rid})
+                             detail={"error": "server missing Groq API keys", "request_id": rid})
 
     audio_bytes = await file.read()
     log.info(f"[{rid}] /transcribe: {len(audio_bytes)} bytes, model={model}")
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    attempts = len(groq_pool)
+    last_status = 502
+    last_body_text = "all Groq API keys exhausted"
+
+    for attempt in range(1, attempts + 1):
+        key = await groq_pool.current()
         try:
-            resp = await client.post(
-                GROQ_TRANSCRIBE_URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY_1}"},
-                files={"file": (file.filename, audio_bytes, file.content_type)},
-                data={"model": model, "response_format": response_format},
-            )
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    GROQ_TRANSCRIBE_URL,
+                    headers={"Authorization": f"Bearer {key}"},
+                    files={"file": (file.filename, audio_bytes, file.content_type)},
+                    data={"model": model, "response_format": response_format},
+                )
         except httpx.RequestError as e:
-            log.error(f"[{rid}] /transcribe: upstream (Groq) request failed: {e!r}")
+            log.error(f"[{rid}] /transcribe: key #{attempt}/{attempts} network error: {e!r}")
+            last_status, last_body_text = 502, f"upstream request failed: {e}"
+            await groq_pool.advance()
+            continue
+
+        if resp.status_code == 429 or resp.status_code in (401, 403):
+            body_text = resp.text[:500]
+            cooldown = GroqKeyPool.DEFAULT_COOLDOWN_SECS
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("retry-after")
+                if retry_after and retry_after.strip().isdigit():
+                    cooldown = float(retry_after)
+            else:
+                cooldown = GroqKeyPool.AUTH_FAILURE_COOLDOWN_SECS
+            log.warning(
+                f"[{rid}] /transcribe: key #{attempt}/{attempts} hit HTTP "
+                f"{resp.status_code} — cooling it down {cooldown:.0f}s and "
+                f"rotating to next key: {body_text}"
+            )
+            last_status, last_body_text = resp.status_code, body_text
+            await groq_pool.advance(bad_key=key, cooldown_secs=cooldown)
+            continue
+
+        if resp.status_code != 200:
+            body_text = resp.text[:500]
+            log.error(f"[{rid}] /transcribe: Groq returned HTTP {resp.status_code}: {body_text}")
             raise HTTPException(
-                status_code=502,
-                detail={"error": f"upstream request failed: {e}",
-                        "source": "groq", "request_id": rid},
+                status_code=resp.status_code,
+                detail={"error": body_text, "source": "groq", "request_id": rid},
             )
 
-    if resp.status_code != 200:
-        body_text = resp.text[:500]
-        log.error(f"[{rid}] /transcribe: Groq returned HTTP {resp.status_code}: {body_text}")
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail={"error": body_text, "source": "groq", "request_id": rid},
-        )
+        if attempt > 1:
+            log.info(f"[{rid}] /transcribe: succeeded on key #{attempt}/{attempts} after failover")
+        return PlainTextResponse(resp.text)
 
-    return PlainTextResponse(resp.text)
+    log.error(f"[{rid}] /transcribe: exhausted all {attempts} Groq keys — last error: {last_body_text}")
+    raise HTTPException(
+        status_code=last_status if last_status not in (429, 401, 403) else 429,
+        detail={"error": last_body_text, "source": "groq", "request_id": rid},
+    )
 
 
 @app.get("/model/{key}")
